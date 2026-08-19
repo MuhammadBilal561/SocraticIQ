@@ -13,6 +13,7 @@ import {
   Lightbulb,
   Clock,
   Terminal,
+  Trash2,
 } from "lucide-react";
 
 /* ─── Pattern color mapping ─── */
@@ -46,7 +47,7 @@ const listItem = {
 };
 
 export default function HistoryPage() {
-  const { state } = useSession();
+  const { state, removeSession, clearAllSessions } = useSession();
   const [searchParams, setSearchParams] = useSearchParams();
   const initialCategory = searchParams.get("category") as PatternCategory | null;
   const [filter, setFilter] = useState<PatternCategory | "All">(
@@ -275,6 +276,18 @@ export default function HistoryPage() {
             ? `${state.sessions.length} session${state.sessions.length !== 1 ? "s" : ""}`
             : `${filtered.length} of ${state.sessions.length} session${state.sessions.length !== 1 ? "s" : ""}`}
         </p>
+        <button
+          onClick={() => {
+            if (window.confirm("Clear all sessions? This cannot be undone.")) {
+              clearAllSessions();
+            }
+          }}
+          className="text-xs font-code text-destructive/70 hover:text-destructive flex items-center gap-1 transition-colors duration-150 cursor-pointer"
+          aria-label="Clear all sessions"
+        >
+          <Trash2 className="w-3 h-3" />
+          $ clear all
+        </button>
       </div>
 
       {/* Session list */}
@@ -305,10 +318,17 @@ export default function HistoryPage() {
           <AnimatePresence>
             {filtered.map((session) => (
               <motion.div key={session.id} variants={listItem} layout>
-                <button
+                <div
                   onClick={() => setSelectedSession(session)}
-                  className="w-full text-left p-3 rounded-xl terminal-border border-neon-green/10 hover:border-neon-green/25 transition-all duration-150 cursor-pointer bg-surface/30 hover:bg-surface-hover/60 group"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setSelectedSession(session);
+                    }
+                  }}
+                  tabIndex={0}
                   role="listitem"
+                  className="w-full text-left p-3 pb-10 rounded-xl terminal-border border-neon-green/10 hover:border-neon-green/25 focus:outline-none focus:ring-2 focus:ring-neon-green/40 transition-all duration-150 cursor-pointer bg-surface/30 hover:bg-surface-hover/60 group relative"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0 flex-1">
@@ -362,7 +382,22 @@ export default function HistoryPage() {
                       })}
                     </div>
                   </div>
-                </button>
+
+                  {/* Delete */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (window.confirm(`Delete session "${session.problemTitle}"?`)) {
+                        removeSession(session.id);
+                      }
+                    }}
+                    className="absolute right-2.5 bottom-2.5 w-6 h-6 rounded-md flex items-center justify-center text-foreground/30 hover:text-destructive hover:bg-destructive/10 transition-colors duration-150 cursor-pointer opacity-0 group-hover:opacity-100"
+                    aria-label={`Delete session ${session.problemTitle}`}
+                    title="Delete session"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               </motion.div>
             ))}
           </AnimatePresence>

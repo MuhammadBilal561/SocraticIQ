@@ -1,8 +1,7 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { useSession } from "../store/SessionContext";
 import { useAuth } from "../store/AuthContext";
-import { Brain, BarChart3, History, Terminal, LogOut, User } from "lucide-react";
-import { motion } from "framer-motion";
+import { Brain, BarChart3, History, Terminal, LogOut } from "lucide-react";
 
 const navItems = [
   { to: "/practice", label: "Problem", icon: Brain },

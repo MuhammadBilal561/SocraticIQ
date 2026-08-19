@@ -1,11 +1,10 @@
 import { useState } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { motion } from "framer-motion";
 import { Terminal, Loader2, Eye, EyeOff } from "lucide-react";
 import { useAuth } from "../../store/AuthContext";
 
 export default function SignupPage() {
-  const navigate = useNavigate();
   const { signUp } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
