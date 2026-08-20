@@ -164,10 +164,6 @@ export default function LandingPage() {
   const heroOpacity = useTransform(scrollYProgress, [0, 0.15], [1, 0]);
   const heroScale = useTransform(scrollYProgress, [0, 0.15], [1, 0.95]);
 
-  const initials = user?.email
-    ? user.email.split("@")[0].slice(0, 2).toUpperCase()
-    : null;
-
   return (
     <div className="relative min-h-screen overflow-x-hidden">
       {/* Scanline CRT effect */}

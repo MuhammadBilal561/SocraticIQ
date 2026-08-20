@@ -1,5 +1,6 @@
 import type { PatternCategory, HintLevel, Message, AIResponse } from "../types";
-import { EDGE_FUNCTION_URL } from "../lib/supabase";
+import { supabase, EDGE_FUNCTION_URL } from "../lib/supabase";
+import { env } from "../config/env";
 import {
   generateFirstQuestion as mockFirstQuestion,
   generateFollowUpQuestion as mockFollowUp,
@@ -11,6 +12,18 @@ import {
 // ─── Edge Function client ────────────────────────────────────────────────
 
 let _available: boolean | null = null;
+
+export class AIBackendUnavailableError extends Error {
+  constructor(action: string) {
+    super(`AI backend unavailable for action "${action}".`);
+    this.name = "AIBackendUnavailableError";
+  }
+}
+
+/** Whether the mock AI fallback is explicitly enabled (development only). */
+export function isMockAIEnabled(): boolean {
+  return env.enableMockAi;
+}
 
 async function checkAvailability(): Promise<boolean> {
   if (_available !== null) return _available;
@@ -26,13 +39,31 @@ async function checkAvailability(): Promise<boolean> {
   return _available;
 }
 
+/** Retrieves the current Supabase session access token for authenticated requests. */
+async function getAccessToken(): Promise<string | null> {
+  const { data } = await supabase.auth.getSession();
+  return data.session?.access_token ?? null;
+}
+
 async function callEdge(action: string, payload: Record<string, unknown>): Promise<AIResponse> {
+  const token = await getAccessToken();
+  if (!token) {
+    throw new AIBackendUnavailableError(action);
+  }
+
   const res = await fetch(EDGE_FUNCTION_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
     body: JSON.stringify({ action, ...payload }),
     signal: AbortSignal.timeout(15000),
   });
+
+  if (res.status === 401) {
+    throw new AIBackendUnavailableError(action);
+  }
 
   if (!res.ok) {
     const errBody = await res.text();
@@ -42,6 +73,32 @@ async function callEdge(action: string, payload: Record<string, unknown>): Promi
   const data = await res.json();
   if (data.error) throw new Error(data.error);
   return { text: data.text };
+}
+
+/**
+ * Invoke the edge function with mock fallback.
+ *
+ * When `VITE_ENABLE_MOCK_AI` is false (the production-safe default), a
+ * backend failure throws so the UI can surface a real error instead of
+ * silently showing fabricated AI responses.
+ */
+async function callWithMock(
+  action: string,
+  payload: Record<string, unknown>,
+  mock: () => AIResponse,
+): Promise<AIResponse> {
+  const available = await checkAvailability();
+  if (!available) {
+    if (isMockAIEnabled()) return mock();
+    throw new AIBackendUnavailableError(action);
+  }
+
+  try {
+    return await callEdge(action, payload);
+  } catch (err) {
+    if (isMockAIEnabled()) return mock();
+    throw err;
+  }
 }
 
 // ─── LeetCode Problem Fetch ──────────────────────────────────────────────
@@ -54,9 +111,15 @@ export async function fetchLeetCodeProblem(url: string): Promise<{
   hints: string[];
 } | null> {
   try {
+    const token = await getAccessToken();
+    if (!token) return null;
+
     const res = await fetch(EDGE_FUNCTION_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({ action: "leetcode-fetch", url }),
       signal: AbortSignal.timeout(10000),
     });
@@ -84,14 +147,11 @@ export async function getFirstQuestion(
   title: string,
   description: string,
 ): Promise<AIResponse> {
-  const available = await checkAvailability();
-  if (!available) return mockFirstQuestion(pattern);
-
-  try {
-    return await callEdge("first-question", { pattern, title, description });
-  } catch {
-    return mockFirstQuestion(pattern);
-  }
+  return callWithMock(
+    "first-question",
+    { pattern, title, description },
+    () => mockFirstQuestion(pattern),
+  );
 }
 
 export async function getFollowUp(
@@ -99,19 +159,11 @@ export async function getFollowUp(
   title: string,
   conversation: Message[],
 ): Promise<AIResponse> {
-  const available = await checkAvailability();
-  if (!available) {
-    const convText = conversation.map((m) => m.content);
-    return mockFollowUp(convText);
-  }
-
-  try {
-    const serialized = conversation.map((m) => ({ role: m.role, content: m.content }));
-    return await callEdge("follow-up", { pattern, title, conversation: serialized });
-  } catch {
-    const convText = conversation.map((m) => m.content);
-    return mockFollowUp(convText);
-  }
+  return callWithMock(
+    "follow-up",
+    { pattern, title, conversation: conversation.map((m) => ({ role: m.role, content: m.content })) },
+    () => mockFollowUp(conversation.map((m) => m.content)),
+  );
 }
 
 export async function getHint(
@@ -121,15 +173,17 @@ export async function getHint(
   hintLevel: Exclude<HintLevel, 0>,
   conversation: Message[],
 ): Promise<AIResponse> {
-  const available = await checkAvailability();
-  if (!available) return mockHint(hintLevel);
-
-  try {
-    const serialized = conversation.map((m) => ({ role: m.role, content: m.content }));
-    return await callEdge("hint", { pattern, title, description, hintLevel, conversation: serialized });
-  } catch {
-    return mockHint(hintLevel);
-  }
+  return callWithMock(
+    "hint",
+    {
+      pattern,
+      title,
+      description,
+      hintLevel,
+      conversation: conversation.map((m) => ({ role: m.role, content: m.content })),
+    },
+    () => mockHint(hintLevel),
+  );
 }
 
 export async function getFeedback(
@@ -139,14 +193,11 @@ export async function getFeedback(
   title: string,
   description: string,
 ): Promise<AIResponse> {
-  const available = await checkAvailability();
-  if (!available) return mockFeedback(code);
-
-  try {
-    return await callEdge("feedback", { code, language, pattern, title, description });
-  } catch {
-    return mockFeedback(code);
-  }
+  return callWithMock(
+    "feedback",
+    { code, language, pattern, title, description },
+    () => mockFeedback(code),
+  );
 }
 
 export async function getReveal(
@@ -154,14 +205,11 @@ export async function getReveal(
   title: string,
   description: string,
 ): Promise<AIResponse> {
-  const available = await checkAvailability();
-  if (!available) return mockReveal(pattern);
-
-  try {
-    return await callEdge("reveal", { pattern, title, description });
-  } catch {
-    return mockReveal(pattern);
-  }
+  return callWithMock(
+    "reveal",
+    { pattern, title, description },
+    () => mockReveal(pattern),
+  );
 }
 
 export function resetAvailability() {

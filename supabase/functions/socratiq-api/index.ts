@@ -1,37 +1,181 @@
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+import { createClient } from "@supabase/supabase-js";
+import { corsHeaders } from "../_shared/cors.ts";
 
 const GEMINI_MODEL = "gemini-2.0-flash-lite";
+const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models";
+
+const ALL_PATTERNS = [
+  "Arrays & Hashing",
+  "Two Pointers",
+  "Sliding Window",
+  "Stack",
+  "Binary Search",
+  "Linked List",
+  "Trees",
+  "Tries",
+  "Backtracking",
+  "Dynamic Programming",
+];
+
+// ─── Validation / Error types ─────────────────────────────────────────────
+
+class AppError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "AppError";
+  }
+}
+
+class AuthError extends AppError {
+  constructor(message: string) {
+    super(message, 401);
+    this.name = "AuthError";
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(message: string) {
+    super(message, 400);
+    this.name = "ValidationError";
+  }
+}
+
+// Reasonable client-side limits (kept intentionally simple; the UI enforces
+// its own stricter UX limits).
+const MAX_TITLE = 300;
+const MAX_DESCRIPTION = 6000;
+const MAX_CODE = 20000;
+const MAX_URL = 500;
+const MAX_MESSAGE_LENGTH = 2000;
+const MAX_CONVERSATION = 50;
+
+function assertString(value: unknown, field: string, maxLength: number): string {
+  if (typeof value !== "string") {
+    throw new ValidationError(`Field "${field}" must be a string.`);
+  }
+  if (value.length > maxLength) {
+    throw new ValidationError(`Field "${field}" exceeds the maximum length.`);
+  }
+  if (!value.trim()) {
+    throw new ValidationError(`Field "${field}" is required.`);
+  }
+  return value;
+}
+
+function assertPattern(value: unknown): string {
+  const pattern = assertString(value, "pattern", 50);
+  if (!ALL_PATTERNS.includes(pattern)) {
+    throw new ValidationError("Field \"pattern\" is not a supported category.");
+  }
+  return pattern;
+}
+
+function assertConversation(value: unknown): { role: string; content: string }[] {
+  if (!Array.isArray(value)) {
+    throw new ValidationError("Field \"conversation\" must be an array.");
+  }
+  if (value.length > MAX_CONVERSATION) {
+    throw new ValidationError("Field \"conversation\" has too many messages.");
+  }
+  return value.map((item, i) => {
+    if (typeof item !== "object" || item === null) {
+      throw new ValidationError(`conversation[${i}] must be an object.`);
+    }
+    const role = assertString((item as Record<string, unknown>).role, `conversation[${i}].role`, 10);
+    if (role !== "user" && role !== "ai") {
+      throw new ValidationError(`conversation[${i}].role must be "user" or "ai".`);
+    }
+    const content = assertString((item as Record<string, unknown>).content, `conversation[${i}].content`, MAX_MESSAGE_LENGTH);
+    return { role, content };
+  });
+}
+
+function assertHintLevel(value: unknown): number {
+  if (value !== 1 && value !== 2 && value !== 3) {
+    throw new ValidationError("Field \"hintLevel\" must be 1, 2, or 3.");
+  }
+  return value;
+}
+
+function assertUrl(value: unknown): string {
+  return assertString(value, "url", MAX_URL);
+}
+
+function assertCode(value: unknown): string {
+  return assertString(value, "code", MAX_CODE);
+}
+
+// ─── Authentication ───────────────────────────────────────────────────────
+
+/**
+ * Validate the bearer token against Supabase Auth.
+ *
+ * `SUPABASE_URL` and `SUPABASE_ANON_KEY` are injected automatically into
+ * every Supabase Edge Function. Only the anon key is used — never the
+ * service-role key, which must stay out of any code path reachable by the
+ * browser. The request's token is validated with `auth.getUser`, so a
+ * client can never claim another user's identity via the request body.
+ */
+async function requireAuth(req: Request): Promise<void> {
+  const authHeader = req.headers.get("Authorization") ?? "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : null;
+
+  if (!token) {
+    throw new AuthError("Missing bearer token.");
+  }
+
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const supabaseAnonKey = Deno.env.get("SUPABASE_ANON_KEY");
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error("Supabase environment is not configured.");
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    global: { headers: { Authorization: `Bearer ${supabaseAnonKey}` } },
+  });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) {
+    throw new AuthError("Invalid or expired bearer token.");
+  }
+}
+
+// ─── Gemini ───────────────────────────────────────────────────────────────
 
 async function callGemini(prompt: string): Promise<string> {
   const apiKey = Deno.env.get("GEMINI_API_KEY");
-  if (!apiKey) throw new Error("GEMINI_API_KEY not configured");
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not configured on the server.");
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 500,
-        },
-      }),
+  const res = await fetch(`${GEMINI_URL}/${GEMINI_MODEL}:generateContent`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
     },
-  );
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 500,
+      },
+    }),
+  });
 
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini API error (${res.status}): ${errText}`);
+    // Diagnostic detail stays server-side; never echo provider error bodies.
+    const errBody = (await res.text()).slice(0, 500);
+    console.error(`[socratiq-api] Gemini error (${res.status}): ${errBody}`);
+    throw new Error("The AI service could not complete the request.");
   }
 
   const data = await res.json();
   const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  if (!text.trim()) {
+    throw new Error("The AI service returned an empty response.");
+  }
   return text.trim();
 }
 
@@ -57,14 +201,14 @@ async function fetchLeetCodeProblem(slug: string) {
   });
 
   if (!res.ok) {
-    throw new Error(`LeetCode API error: ${res.status}`);
+    console.error(`[socratiq-api] LeetCode fetch error (${res.status}) for slug "${slug}".`);
+    throw new Error("Could not fetch the problem from LeetCode.");
   }
 
   const data = await res.json();
   const q = data?.data?.question;
   if (!q) {
-    const errMsg = data?.errors?.[0]?.message ?? "Problem not found";
-    throw new Error(`LeetCode: ${errMsg}`);
+    throw new Error("The requested problem was not found on LeetCode.");
   }
 
   return {
@@ -91,15 +235,18 @@ function stripHtml(html: string): string {
 }
 
 function extractSlug(input: string): string {
-  const match = input.match(/leetcode\.com\/problems\/([a-z0-9-]+)/i);
+  const url = assertUrl(input);
+  const match = url.match(/leetcode\.com\/problems\/([a-z0-9-]+)/i);
   if (match) return match[1];
-  return input.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+  const slug = url.trim().toLowerCase().replace(/[^a-z0-9-]/g, "");
+  if (!slug) throw new ValidationError("Invalid LeetCode problem URL.");
+  return slug;
 }
 
 // ─── AI Prompts ───────────────────────────────────────────────────────────
 
 async function handleFirstQuestion(pattern: string, title: string, description: string): Promise<string> {
-  const prompt = `You are a Socratic tutor helping a student solve a coding problem. 
+  const prompt = `You are a Socratic tutor helping a student solve a coding problem.
 The problem pattern is "${pattern}".
 Problem title: "${title}"
 Problem description: "${description.slice(0, 1000)}"
@@ -235,20 +382,45 @@ function detectPattern(title: string, description: string, tags: string[]): stri
 
 // ─── Router ───────────────────────────────────────────────────────────────
 
+function jsonResponse(body: unknown, status: number, cors: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...cors, "Content-Type": "application/json" },
+  });
+}
+
 Deno.serve(async (req: Request) => {
+  const cors = corsHeaders(req);
+
   if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+    return new Response("ok", { status: 200, headers: cors });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed." }, 405, cors);
   }
 
   try {
-    const body = await req.json();
-    const { action } = body;
+    await requireAuth(req);
+
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return jsonResponse({ error: "Request body must be valid JSON." }, 400, cors);
+    }
+
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return jsonResponse({ error: "Request body must be a JSON object." }, 400, cors);
+    }
+    const b = body as Record<string, unknown>;
+    const action = b.action;
 
     let result: unknown;
 
     switch (action) {
       case "leetcode-fetch": {
-        const slug = extractSlug(body.url);
+        const slug = extractSlug(b.url);
         const problem = await fetchLeetCodeProblem(slug);
         const pattern = detectPattern(problem.title, problem.description, problem.tags);
         result = { ...problem, pattern };
@@ -256,51 +428,66 @@ Deno.serve(async (req: Request) => {
       }
 
       case "first-question": {
-        const text = await handleFirstQuestion(body.pattern, body.title, body.description);
+        const pattern = assertPattern(b.pattern);
+        const title = assertString(b.title, "title", MAX_TITLE);
+        const description = assertString(b.description, "description", MAX_DESCRIPTION);
+        const text = await handleFirstQuestion(pattern, title, description);
         result = { text };
         break;
       }
 
       case "follow-up": {
-        const text = await handleFollowUp(body.pattern, body.title, body.conversation ?? []);
+        const pattern = assertPattern(b.pattern);
+        const title = assertString(b.title, "title", MAX_TITLE);
+        const conversation = assertConversation(b.conversation);
+        const text = await handleFollowUp(pattern, title, conversation);
         result = { text };
         break;
       }
 
       case "hint": {
-        const text = await handleHint(body.pattern, body.title, body.description, body.hintLevel, body.conversation ?? []);
+        const pattern = assertPattern(b.pattern);
+        const title = assertString(b.title, "title", MAX_TITLE);
+        const description = assertString(b.description, "description", MAX_DESCRIPTION);
+        const hintLevel = assertHintLevel(b.hintLevel);
+        const conversation = assertConversation(b.conversation);
+        const text = await handleHint(pattern, title, description, hintLevel, conversation);
         result = { text };
         break;
       }
 
       case "feedback": {
-        const text = await handleFeedback(body.code, body.language, body.pattern, body.title, body.description);
+        const pattern = assertPattern(b.pattern);
+        const title = assertString(b.title, "title", MAX_TITLE);
+        const description = assertString(b.description, "description", MAX_DESCRIPTION);
+        const code = assertCode(b.code);
+        const language = assertString(b.language, "language", 50);
+        const text = await handleFeedback(code, language, pattern, title, description);
         result = { text };
         break;
       }
 
       case "reveal": {
-        const text = await handleReveal(body.pattern, body.title, body.description);
+        const pattern = assertPattern(b.pattern);
+        const title = assertString(b.title, "title", MAX_TITLE);
+        const description = assertString(b.description, "description", MAX_DESCRIPTION);
+        const text = await handleReveal(pattern, title, description);
         result = { text };
         break;
       }
 
       default:
-        return new Response(
-          JSON.stringify({ error: `Unknown action: ${action}` }),
-          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-        );
+        return jsonResponse({ error: `Unknown action: ${String(action)}` }, 400, cors);
     }
 
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return jsonResponse(result, 200, cors);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Internal server error";
-    console.error("socratiq-api error:", message);
-    return new Response(JSON.stringify({ error: message }), {
-      status: 500,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    if (err instanceof AppError) {
+      return jsonResponse({ error: err.message }, err.status, cors);
+    }
+    // Unknown error: log diagnostics, return a safe generic message.
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[socratiq-api] Internal error: ${message}`);
+    return jsonResponse({ error: "Internal server error." }, 500, cors);
   }
 });

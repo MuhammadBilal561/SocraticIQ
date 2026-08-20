@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useReducer, useCallback, useEffect } from "react";
-import type { Session, Message, PatternCategory, CodeAttempt, AIResponse } from "../types";
+import type { Session, Message, PatternCategory, CodeAttempt } from "../types";
 import { inferPatternFromProblem } from "../utils/patterns";
-import { loadSessions, saveSession } from "../utils/storage";
+import { useAuth } from "./AuthContext";
+import { loadSessions, saveSession, deleteSession, clearSessions } from "../utils/storage";
 import {
   getFirstQuestion,
   getFollowUp,
@@ -13,6 +14,8 @@ import {
 // ─── State ───────────────────────────────────────────────────────────────
 
 interface SessionState {
+  /** The authenticated user's id, or null when signed out. */
+  userId: string | null;
   currentSession: Session | null;
   sessions: Session[];
   isLoading: boolean;
@@ -23,6 +26,7 @@ interface SessionState {
 }
 
 const initialState: SessionState = {
+  userId: null,
   currentSession: null,
   sessions: [],
   isLoading: false,
@@ -43,7 +47,9 @@ type SessionAction =
   | { type: "TOGGLE_HINT_COLLAPSE"; messageId: string }
   | { type: "SET_LOADING"; isLoading: boolean }
   | { type: "SET_AI_RESPONDING"; isResponding: boolean }
+  | { type: "SET_USER_ID"; userId: string | null }
   | { type: "LOAD_SESSIONS"; sessions: Session[] }
+  | { type: "REMOVE_SESSION"; sessionId: string }
   | { type: "RESTORE_SESSION"; session: Session | null }
   | { type: "RESET_SESSION" };
 
@@ -58,22 +64,25 @@ function computeHintsLeft(session: Session): number {
   return Math.max(0, 3 - hintsUsed);
 }
 
-function persist(session: Session, existingSessions: Session[]): Session[] {
-  saveSession(session);
-  const sessions = [...existingSessions];
-  const idx = sessions.findIndex((s) => s.id === session.id);
-  if (idx >= 0) {
-    sessions[idx] = session;
-  } else {
-    sessions.unshift(session);
-  }
-  return sessions;
+function aiErrorMessage(action: string): Message {
+  return {
+    id: uid(),
+    role: "ai",
+    type: "question",
+    content:
+      `I couldn't reach the AI service (${action}). ` +
+      `Make sure you're signed in and the backend is available, then try again.`,
+    timestamp: Date.now(),
+  };
 }
 
 // ─── Reducer ─────────────────────────────────────────────────────────────
 
 function reducer(state: SessionState, action: SessionAction): SessionState {
   switch (action.type) {
+    case "SET_USER_ID":
+      return { ...state, userId: action.userId };
+
     case "START_SESSION":
       return { ...state, currentSession: action.session, hintPoints: 0 };
 
@@ -104,8 +113,11 @@ function reducer(state: SessionState, action: SessionAction): SessionState {
         ...state.currentSession,
         status: action.status,
       };
-      const sessions = persist(updated, state.sessions);
-      return { ...state, currentSession: updated, sessions };
+      if (state.userId) {
+        const sessions = saveSession(state.userId, updated);
+        return { ...state, currentSession: updated, sessions };
+      }
+      return { ...state, currentSession: updated };
     }
 
     case "MARK_REVEALED": {
@@ -115,8 +127,11 @@ function reducer(state: SessionState, action: SessionAction): SessionState {
         status: "revealed",
         hintsUsed: 3,
       };
-      const sessions = persist(updated, state.sessions);
-      return { ...state, currentSession: updated, hintPoints: 0, sessions };
+      if (state.userId) {
+        const sessions = saveSession(state.userId, updated);
+        return { ...state, currentSession: updated, hintPoints: 0, sessions };
+      }
+      return { ...state, currentSession: updated, hintPoints: 0 };
     }
 
     case "SET_HINT_POINTS":
@@ -147,6 +162,13 @@ function reducer(state: SessionState, action: SessionAction): SessionState {
     case "LOAD_SESSIONS":
       return { ...state, sessions: action.sessions };
 
+    case "REMOVE_SESSION": {
+      const sessions = state.sessions.filter((s) => s.id !== action.sessionId);
+      const currentSession =
+        state.currentSession?.id === action.sessionId ? null : state.currentSession;
+      return { ...state, sessions, currentSession, hintPoints: 0 };
+    }
+
     case "RESTORE_SESSION":
       if (!action.session) return state;
       return {
@@ -175,6 +197,8 @@ interface SessionContextType {
   giveUp: () => Promise<void>;
   resetSession: () => void;
   restoreSession: (session: Session) => void;
+  removeSession: (sessionId: string) => void;
+  clearAllSessions: () => void;
   fetchProblem: (url: string) => Promise<{
     title: string;
     description: string;
@@ -187,12 +211,25 @@ const SessionContext = createContext<SessionContextType | null>(null);
 // ─── Provider ────────────────────────────────────────────────────────────
 
 export function SessionProvider({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
   const [state, dispatch] = useReducer(reducer, initialState);
+  const userId = user?.id ?? null;
 
+  // Keep the storage namespace in sync with the signed-in user.
   useEffect(() => {
-    const sessions = loadSessions();
+    dispatch({ type: "SET_USER_ID", userId });
+
+    if (!userId) {
+      // Signed out (or loading): never expose another user's sessions.
+      dispatch({ type: "RESET_SESSION" });
+      dispatch({ type: "LOAD_SESSIONS", sessions: [] });
+      return;
+    }
+
+    dispatch({ type: "RESET_SESSION" });
+    const sessions = loadSessions(userId);
     dispatch({ type: "LOAD_SESSIONS", sessions });
-  }, []);
+  }, [userId]);
 
   // ── Start session ────────────────────────────────────────────────────
 
@@ -227,15 +264,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         };
         dispatch({ type: "ADD_MESSAGE", message: firstMsg });
       } catch {
-        // Shouldn't happen since mock fallback is always available
-        const fallbackMsg: Message = {
-          id: uid(),
-          role: "ai",
-          type: "question",
-          content: "What approaches come to mind for solving this problem?",
-          timestamp: Date.now(),
-        };
-        dispatch({ type: "ADD_MESSAGE", message: fallbackMsg });
+        dispatch({ type: "ADD_MESSAGE", message: aiErrorMessage("first-question") });
       } finally {
         dispatch({ type: "SET_LOADING", isLoading: false });
       }
@@ -278,7 +307,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         };
         dispatch({ type: "ADD_MESSAGE", message: aiMsg });
       } catch {
-        // noop — mock fallback handles it
+        dispatch({ type: "ADD_MESSAGE", message: aiErrorMessage("follow-up") });
       } finally {
         dispatch({ type: "SET_AI_RESPONDING", isResponding: false });
       }
@@ -310,7 +339,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: "ADD_MESSAGE", message: feedbackMsg });
         dispatch({ type: "MARK_SOLVED", status: "submitted" });
       } catch {
-        // noop
+        dispatch({ type: "ADD_MESSAGE", message: aiErrorMessage("feedback") });
       } finally {
         dispatch({ type: "SET_LOADING", isLoading: false });
       }
@@ -362,7 +391,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         dispatch({ type: "SET_HINT_POINTS", count: state.hintPoints - 1 });
       }
     } catch {
-      // noop
+      dispatch({ type: "ADD_MESSAGE", message: aiErrorMessage("hint") });
     } finally {
       dispatch({ type: "SET_AI_RESPONDING", isResponding: false });
     }
@@ -388,7 +417,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       dispatch({ type: "ADD_MESSAGE", message: revealMsg });
       dispatch({ type: "MARK_REVEALED" });
     } catch {
-      // noop
+      dispatch({ type: "ADD_MESSAGE", message: aiErrorMessage("reveal") });
     } finally {
       dispatch({ type: "SET_LOADING", isLoading: false });
     }
@@ -400,7 +429,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: "TOGGLE_HINT_COLLAPSE", messageId });
   }, []);
 
-  // ── Restore / Reset ──────────────────────────────────────────────────
+  // ── Restore / Reset / Delete ─────────────────────────────────────────
 
   const restoreSession = useCallback((session: Session) => {
     dispatch({ type: "RESTORE_SESSION", session });
@@ -409,6 +438,22 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const resetSession = useCallback(() => {
     dispatch({ type: "RESET_SESSION" });
   }, []);
+
+  const removeSession = useCallback(
+    (sessionId: string) => {
+      if (!state.userId) return;
+      dispatch({ type: "REMOVE_SESSION", sessionId });
+      deleteSession(state.userId, sessionId);
+    },
+    [state.userId],
+  );
+
+  const clearAllSessions = useCallback(() => {
+    if (!state.userId) return;
+    dispatch({ type: "LOAD_SESSIONS", sessions: [] });
+    dispatch({ type: "RESET_SESSION" });
+    clearSessions(state.userId);
+  }, [state.userId]);
 
   // ── Fetch LeetCode problem ───────────────────────────────────────────
 
@@ -439,6 +484,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         giveUp,
         resetSession,
         restoreSession,
+        removeSession,
+        clearAllSessions,
         fetchProblem,
       }}
     >
